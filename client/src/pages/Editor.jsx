@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
 import axios from 'axios';
 import io from 'socket.io-client';
@@ -8,7 +8,9 @@ import Quill from 'quill';
 import 'quill/dist/quill.snow.css';
 import Navbar from '../components/Navbar';
 import Loader from '../components/Loader';
-import { FiArrowLeft, FiShare2, FiCheck } from 'react-icons/fi';
+import VersionHistory from '../components/VersionHistory';
+import { FiArrowLeft, FiShare2, FiCheck, FiDownload, FiClock, FiBarChart2 } from 'react-icons/fi';
+import { useAuth } from '../context/AuthContext';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
@@ -24,18 +26,32 @@ const TOOLBAR_OPTIONS = [
     ['clean'],
 ];
 
+function getStats(quill) {
+    if (!quill) return { words: 0, chars: 0, readTime: 0 };
+    const text = quill.getText().trim();
+    const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    const chars = text.length;
+    const readTime = Math.max(1, Math.ceil(words / 200));
+    return { words, chars, readTime };
+}
+
 const Editor = () => {
     const { id } = useParams();
     const navigate = useNavigate();
+    const { user } = useAuth();
     const [socket, setSocket] = useState(null);
     const [quill, setQuill] = useState(null);
     const [title, setTitle] = useState('Untitled Document');
     const [loading, setLoading] = useState(true);
     const [saved, setSaved] = useState(false);
-    const [activeUsers, setActiveUsers] = useState(1);
+    const [stats, setStats] = useState({ words: 0, chars: 0, readTime: 1 });
+    const [collaborators, setCollaborators] = useState([]);
+    const [showVersions, setShowVersions] = useState(false);
+    const [showStats, setShowStats] = useState(false);
     const titleDebounce = useRef(null);
+    const cursorsRef = useRef({});
 
-    // Initialize socket
+    // Socket init
     useEffect(() => {
         const s = io(SOCKET_URL);
         setSocket(s);
@@ -44,74 +60,96 @@ const Editor = () => {
 
     // Load document meta
     useEffect(() => {
-        const load = async () => {
-            try {
-                const { data } = await axios.get(`${API_URL}/api/documents/${id}`);
-                setTitle(data.title);
-            } catch {
-                toast.error('Document not found or access denied');
-                navigate('/dashboard');
-            } finally {
-                setLoading(false);
-            }
-        };
-        load();
+        axios.get(`${API_URL}/api/documents/${id}`)
+            .then(({ data }) => setTitle(data.title))
+            .catch(() => { toast.error('Document not found'); navigate('/dashboard'); })
+            .finally(() => setLoading(false));
     }, [id, navigate]);
 
-    // Socket: load content and listen for changes
+    // Socket events
     useEffect(() => {
         if (!socket || !quill) return;
 
+        socket.emit('join-document', { documentId: id, userName: user?.name || 'Anonymous' });
+
         socket.once('load-document', (content) => {
-            if (content && content.ops) quill.setContents(content);
+            if (content?.ops) quill.setContents(content);
             quill.enable();
         });
 
-        socket.emit('get-document', id);
+        socket.on('receive-changes', (delta) => quill.updateContents(delta));
+        socket.on('title-updated', (t) => setTitle(t));
+        socket.on('presence-update', (users) => setCollaborators(users));
 
-        const receiveHandler = (delta) => quill.updateContents(delta);
-        socket.on('receive-changes', receiveHandler);
-        socket.on('title-updated', (newTitle) => setTitle(newTitle));
+        // Remote cursors
+        socket.on('remote-cursor', ({ socketId, name, color, index, length }) => {
+            // remove old
+            const old = cursorsRef.current[socketId];
+            if (old) old.remove();
+            // draw new cursor flag
+            try {
+                const bounds = quill.getBounds(index, length);
+                const editorEl = quill.root.parentElement;
+                const flag = document.createElement('div');
+                flag.className = 'remote-cursor-flag';
+                flag.style.cssText = `position:absolute;left:${bounds.left}px;top:${bounds.top - 24}px;background:${color};color:#fff;font-size:11px;padding:2px 6px;border-radius:4px;pointer-events:none;z-index:999;white-space:nowrap;`;
+                flag.textContent = name;
+                const line = document.createElement('div');
+                line.style.cssText = `position:absolute;left:${bounds.left}px;top:${bounds.top}px;width:2px;height:${bounds.height || 18}px;background:${color};pointer-events:none;z-index:999;`;
+                editorEl.style.position = 'relative';
+                editorEl.appendChild(flag);
+                editorEl.appendChild(line);
+                cursorsRef.current[socketId] = { remove: () => { flag.remove(); line.remove(); } };
+                setTimeout(() => cursorsRef.current[socketId]?.remove(), 3000);
+            } catch (_) { }
+        });
 
         return () => {
-            socket.off('receive-changes', receiveHandler);
+            socket.off('receive-changes');
             socket.off('title-updated');
+            socket.off('presence-update');
+            socket.off('remote-cursor');
         };
-    }, [socket, quill, id]);
+    }, [socket, quill, id, user]);
 
-    // Auto-save interval
+    // Auto-save + stats update
     useEffect(() => {
         if (!socket || !quill) return;
         const interval = setInterval(() => {
             const content = quill.getContents();
             socket.emit('save-document', content);
             axios.patch(`${API_URL}/api/documents/${id}`, { content }).catch(() => { });
+            setStats(getStats(quill));
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
         }, SAVE_INTERVAL_MS);
         return () => clearInterval(interval);
     }, [socket, quill, id]);
 
-    // Broadcast local changes to other users
+    // Broadcast changes + cursor position
     useEffect(() => {
         if (!socket || !quill) return;
-        const handler = (delta, _old, source) => {
+        const changeHandler = (delta, _old, source) => {
             if (source !== 'user') return;
             socket.emit('send-changes', delta);
+            setStats(getStats(quill));
         };
-        quill.on('text-change', handler);
-        return () => quill.off('text-change', handler);
+        const selectionHandler = (range) => {
+            if (range) socket.emit('cursor-move', { index: range.index, length: range.length });
+        };
+        quill.on('text-change', changeHandler);
+        quill.on('selection-change', selectionHandler);
+        return () => { quill.off('text-change', changeHandler); quill.off('selection-change', selectionHandler); };
     }, [socket, quill]);
 
-    // Initialize Quill editor
     const wrapperRef = useCallback((wrapper) => {
         if (!wrapper) return;
         wrapper.innerHTML = '';
-        const editor = document.createElement('div');
-        wrapper.append(editor);
-        const q = new Quill(editor, { theme: 'snow', modules: { toolbar: TOOLBAR_OPTIONS } });
+        const ed = document.createElement('div');
+        wrapper.append(ed);
+        const q = new Quill(ed, { theme: 'snow', modules: { toolbar: TOOLBAR_OPTIONS } });
         q.disable();
-        q.setText('Loading content…');
+        q.setText('Loading…');
         setQuill(q);
     }, []);
 
@@ -127,7 +165,49 @@ const Editor = () => {
 
     const copyLink = () => {
         navigator.clipboard.writeText(window.location.href);
-        toast.success('Link copied! Share it with collaborators 🔗');
+        toast.success('Link copied! 🔗');
+    };
+
+    const exportPDF = () => {
+        const printCSS = `
+      <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: Inter, sans-serif; padding: 48px; color: #1a1d2e; line-height: 1.8; }
+        h1 { font-size: 28px; margin-bottom: 4px; }
+        .meta { color: #6b7280; font-size: 13px; margin-bottom: 32px; }
+        .ql-align-center { text-align: center; }
+        .ql-align-right { text-align: right; }
+        blockquote { border-left: 4px solid #6366f1; padding: 8px 16px; margin: 16px 0; color: #6b7280; background: #f5f6fa; }
+        pre { background: #1a1d2e; color: #e8eaf4; padding: 16px; border-radius: 8px; }
+      </style>`;
+        const content = quill?.root?.innerHTML || '';
+        const win = window.open('', '_blank');
+        win.document.write(`<html><head><title>${title}</title>${printCSS}</head><body>
+      <h1>${title}</h1>
+      <div class="meta">Exported from CollabEdit • ${new Date().toLocaleDateString()}</div>
+      ${content}
+    </body></html>`);
+        win.document.close();
+        win.focus();
+        setTimeout(() => { win.print(); win.close(); }, 500);
+        toast.success('PDF export opened!');
+    };
+
+    const saveVersion = async () => {
+        try {
+            await axios.post(`${API_URL}/api/versions/${id}`, { label: `Manual save — ${new Date().toLocaleTimeString()}` });
+            toast.success('Version saved! 📌');
+        } catch { toast.error('Failed to save version'); }
+    };
+
+    const restoreVersion = async (versionId) => {
+        try {
+            const { data } = await axios.post(`${API_URL}/api/versions/${id}/restore/${versionId}`);
+            if (data.content?.ops) quill?.setContents(data.content);
+            if (data.title) setTitle(data.title);
+            setShowVersions(false);
+            toast.success('Version restored! ↩️');
+        } catch { toast.error('Failed to restore'); }
     };
 
     if (loading) return <><Navbar /><Loader /></>;
@@ -135,55 +215,78 @@ const Editor = () => {
     return (
         <div className="editor-page">
             <Navbar />
-            <motion.div
-                className="editor-toolbar-custom"
-                initial={{ opacity: 0, y: -20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.3 }}
-            >
-                <button className="icon-btn back-btn" onClick={() => navigate('/dashboard')} title="Back to dashboard">
-                    <FiArrowLeft />
-                </button>
-                <input
-                    className="title-input"
-                    value={title}
-                    onChange={handleTitleChange}
-                    placeholder="Untitled Document"
-                />
+
+            {/* Top toolbar */}
+            <motion.div className="editor-toolbar-custom" initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}>
+                <button className="icon-btn" onClick={() => navigate('/dashboard')} title="Dashboard"><FiArrowLeft /></button>
+                <input className="title-input" value={title} onChange={handleTitleChange} placeholder="Untitled Document" />
+
                 <div className="editor-meta">
                     {saved && (
-                        <motion.span
-                            className="saved-badge"
-                            initial={{ opacity: 0, scale: 0.8 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            exit={{ opacity: 0 }}
-                        >
+                        <motion.span className="saved-badge" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
                             <FiCheck size={12} /> Saved
                         </motion.span>
                     )}
-                    <div className="active-users">
-                        <span className="user-dot" />
-                        <span>{activeUsers} editing</span>
-                    </div>
-                    <motion.button
-                        className="btn-outline share-btn"
-                        onClick={copyLink}
-                        whileHover={{ scale: 1.05 }}
-                        whileTap={{ scale: 0.95 }}
-                    >
+
+                    {/* Collaborator avatars */}
+                    {collaborators.length > 0 && (
+                        <div className="collab-strip">
+                            {collaborators.slice(0, 5).map((u) => (
+                                <div key={u.socketId} className="collab-avatar" style={{ background: u.color }} title={u.name}>
+                                    {u.name?.[0]?.toUpperCase() || '?'}
+                                </div>
+                            ))}
+                            {collaborators.length > 5 && <span className="collab-more">+{collaborators.length - 5}</span>}
+                        </div>
+                    )}
+
+                    {/* Stats toggle */}
+                    <motion.button className={`icon-btn ${showStats ? 'active-btn' : ''}`} onClick={() => setShowStats(p => !p)} title="Stats" whileHover={{ scale: 1.1 }}>
+                        <FiBarChart2 />
+                    </motion.button>
+
+                    {/* Version history */}
+                    <motion.button className={`icon-btn ${showVersions ? 'active-btn' : ''}`} onClick={() => { saveVersion(); setShowVersions(p => !p); }} title="Version History" whileHover={{ scale: 1.1 }}>
+                        <FiClock />
+                    </motion.button>
+
+                    {/* PDF Export */}
+                    <motion.button className="icon-btn" onClick={exportPDF} title="Export PDF" whileHover={{ scale: 1.1 }}>
+                        <FiDownload />
+                    </motion.button>
+
+                    {/* Share */}
+                    <motion.button className="btn-outline share-btn" onClick={copyLink} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
                         <FiShare2 size={14} /> Share
                     </motion.button>
                 </div>
             </motion.div>
 
-            <motion.div
-                className="editor-container"
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.4, delay: 0.1 }}
-            >
-                <div className="quill-wrapper" ref={wrapperRef} />
-            </motion.div>
+            {/* Stats bar */}
+            <AnimatePresence>
+                {showStats && (
+                    <motion.div className="stats-bar" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }}>
+                        <span>📝 <strong>{stats.words}</strong> words</span>
+                        <span>🔤 <strong>{stats.chars}</strong> characters</span>
+                        <span>⏱️ <strong>{stats.readTime} min</strong> read</span>
+                        <span>👥 <strong>{collaborators.length}</strong> editing now</span>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            <div className="editor-layout">
+                {/* Quill editor */}
+                <motion.div className="editor-container" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
+                    <div className="quill-wrapper" ref={wrapperRef} />
+                </motion.div>
+
+                {/* Version history sidebar */}
+                <AnimatePresence>
+                    {showVersions && (
+                        <VersionHistory docId={id} onRestore={restoreVersion} onClose={() => setShowVersions(false)} />
+                    )}
+                </AnimatePresence>
+            </div>
         </div>
     );
 };
